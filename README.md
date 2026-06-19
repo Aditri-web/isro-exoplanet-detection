@@ -14,11 +14,11 @@ TESS MAST  →  Preprocess  →  TLS Period Search  →  ML Classifier  →  Tra
 |---|---|---|
 | Download | `src/download.py` | TESS PDCSAP LCs via lightkurve / MAST |
 | Preprocess | `src/preprocess.py` | Quality mask, sigma-clip, Wotan detrending, normalise |
-| Period Search | `src/period_search.py` | TransitLeastSquares (TLS), SDE threshold, EB diagnostics |
-| Features | `src/features.py` | 16-D feature vector construction |
-| Classify | `src/classifier.py` | Random Forest → PLANET / EB / BLEND / OTHER |
+| Period Search | `src/period_search.py` | TransitLeastSquares (TLS), SDE threshold, BLS, EB diagnostics |
+| Features | `src/features.py` | 20-D feature vector construction |
+| Classify | `src/classifier.py` | Random Forest + XGBoost → PLANET / EB / BLEND / OTHER |
 | Fit | `src/fitting.py` | batman transit model, Nelder-Mead + optional emcee MCMC |
-| Visualise | `src/visualise.py` | LC plot, periodogram, phase-fold, Plotly dashboard |
+| Visualise | `src/visualise.py` | LC plot, periodogram, phase-fold, Plotly dashboard, BLS periodogram |
 | Report | `src/report.py` | Auto-generated 3-page PDF |
 
 ---

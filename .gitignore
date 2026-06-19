@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs (large files)
+results/figures/*.png
+results/*.html
+results/*.pdf
+models/*.pkl
+
+# Data (keep labels, ignore raw FITS)
+data/raw/*.fits

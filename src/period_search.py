@@ -1,8 +1,12 @@
 """
 src/period_search.py
 --------------------
-Runs TransitLeastSquares (TLS) on preprocessed light curves to detect
-periodic transit-like signals.
+Runs TransitLeastSquares (TLS) and Box Least Squares (BLS) on
+preprocessed light curves to detect periodic transit-like signals.
+
+BLS (Kovács, Zucker & Mazeh 2002) is used via astropy.timeseries.
+TLS (Hippke & Heller 2019) provides an optimised transit-shaped search.
+Both algorithms are run in parallel for cross-validation.
 
 Outputs a structured dict (candidate record) for each target.
 """
@@ -27,9 +31,9 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class TransitCandidate:
-    """Holds TLS results for one target."""
+    """Holds TLS + BLS results for one target."""
     tic_id: str
-    period: float = 0.0           # days
+    period: float = 0.0           # days (best from TLS or BLS)
     t0: float = 0.0               # reference transit mid-time (BTJD)
     duration: float = 0.0         # hours
     depth: float = 0.0            # fractional depth (0–1)
@@ -43,6 +47,17 @@ class TransitCandidate:
     transit_shape_score: float = 0.0  # V vs U shape
     passed_threshold: bool = False
     raw_results: dict = field(default_factory=dict)  # full TLS result dict
+
+    # BLS-specific fields
+    bls_period: float = 0.0       # BLS best-fit period (days)
+    bls_t0: float = 0.0           # BLS transit mid-time
+    bls_depth: float = 0.0        # BLS transit depth (fractional)
+    bls_duration: float = 0.0     # BLS duration (hours)
+    bls_power: float = 0.0        # BLS peak power (SR statistic)
+    bls_sde: float = 0.0          # BLS Signal Detection Efficiency
+    bls_snr: float = 0.0          # BLS signal-to-noise
+    period_agreement: float = 0.0 # |P_TLS - P_BLS| / P_TLS (0 = perfect match)
+    bls_raw: dict = field(default_factory=dict)  # full BLS periodogram
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +129,10 @@ def run_tls(
         candidate.passed_threshold = candidate.sde >= sde_threshold
 
         # Odd-even depth difference (EB diagnostic)
-        candidate.odd_even_diff = _odd_even_diff(results)
+        candidate.odd_even_diff = _odd_even_diff(
+            time_c, flux_c, candidate.period, candidate.t0,
+            candidate.duration / 24.0,
+        )
 
         # Secondary eclipse (EB diagnostic)
         candidate.secondary_depth = _secondary_depth(
@@ -149,26 +167,251 @@ def run_tls(
 
 
 # ---------------------------------------------------------------------------
+# BLS wrapper (astropy)
+# ---------------------------------------------------------------------------
+
+def run_bls(
+    time: np.ndarray,
+    flux: np.ndarray,
+    flux_err: Optional[np.ndarray] = None,
+    tic_id: str = "unknown",
+    period_min: float = 0.5,
+    period_max: float = 27.0,
+    duration_min_hr: float = 0.5,
+    duration_max_hr: float = 12.0,
+    n_durations: int = 20,
+    frequency_factor: float = 1.0,
+) -> dict:
+    """
+    Run Box Least Squares (BLS) on a detrended, normalised light curve.
+
+    Uses astropy.timeseries.BoxLeastSquares (Kovács, Zucker & Mazeh 2002).
+
+    Parameters
+    ----------
+    time : np.ndarray  (days, BTJD)
+    flux : np.ndarray  (normalised, median ≈ 1)
+    flux_err : np.ndarray or None
+    tic_id : str
+    period_min, period_max : float  search range in days
+    duration_min_hr, duration_max_hr : float  trial transit durations
+    n_durations : int  number of trial durations
+    frequency_factor : float  oversampling for the BLS frequency grid
+
+    Returns
+    -------
+    dict with BLS results: period, t0, depth, duration, power, sde, snr,
+         periods array, power_spectrum array.
+    """
+    result = {
+        "period": 0.0, "t0": 0.0, "depth": 0.0, "duration_hr": 0.0,
+        "power": 0.0, "sde": 0.0, "snr": 0.0,
+        "periods": [], "power_spectrum": [],
+    }
+
+    # Remove non-finite values
+    mask = np.isfinite(time) & np.isfinite(flux)
+    if flux_err is not None:
+        mask &= np.isfinite(flux_err)
+    time_c, flux_c = time[mask], flux[mask]
+    flux_err_c = flux_err[mask] if flux_err is not None else None
+
+    if len(time_c) < 200:
+        logger.warning(f"  TIC {tic_id}: too few points ({len(time_c)}) for BLS.")
+        return result
+
+    try:
+        from astropy.timeseries import BoxLeastSquares
+        import astropy.units as u
+
+        # Build the BLS model
+        if flux_err_c is not None:
+            bls = BoxLeastSquares(time_c * u.day, flux_c, dy=flux_err_c)
+        else:
+            bls = BoxLeastSquares(time_c * u.day, flux_c)
+
+        # Generate trial durations
+        durations = np.linspace(
+            duration_min_hr / 24.0, duration_max_hr / 24.0, n_durations
+        ) * u.day
+
+        # Compute the BLS periodogram
+        # Limit period_max to half the time baseline
+        effective_max = min(period_max, (time_c[-1] - time_c[0]) / 2.0)
+        periodogram = bls.autopower(
+            durations,
+            minimum_period=period_min * u.day,
+            maximum_period=effective_max * u.day,
+            frequency_factor=frequency_factor,
+        )
+
+        # Extract best-fit parameters
+        best_idx = np.argmax(periodogram.power)
+        best_period = float(periodogram.period[best_idx].value)
+        best_power = float(periodogram.power[best_idx])
+
+        # Get transit parameters at best period
+        stats = bls.compute_stats(
+            best_period * u.day,
+            float(periodogram.duration[best_idx].value) * u.day,
+            float(periodogram.transit_time[best_idx].value) * u.day,
+        )
+
+        best_t0 = float(periodogram.transit_time[best_idx].value)
+        best_depth = float(stats["depth"][0]) if "depth" in stats else float(periodogram.depth[best_idx])
+        best_duration_hr = float(periodogram.duration[best_idx].value) * 24.0
+
+        # Compute SDE: (peak - mean) / std of the power spectrum
+        power_arr = periodogram.power.copy()
+        power_mean = float(np.nanmean(power_arr))
+        power_std = float(np.nanstd(power_arr))
+        bls_sde = (best_power - power_mean) / max(power_std, 1e-12)
+
+        # Compute SNR from the transit depth and out-of-transit scatter
+        phase = ((time_c - best_t0) % best_period) / best_period
+        half_dur_phase = (best_duration_hr / 24.0) / best_period / 2.0
+        in_transit = (phase < half_dur_phase) | (phase > 1.0 - half_dur_phase)
+        out_transit = ~in_transit
+        if in_transit.sum() > 0 and out_transit.sum() > 0:
+            bls_snr = abs(np.nanmean(flux_c[in_transit]) - np.nanmean(flux_c[out_transit])) / (
+                np.nanstd(flux_c[out_transit]) + 1e-12
+            )
+        else:
+            bls_snr = 0.0
+
+        result = {
+            "period": best_period,
+            "t0": best_t0,
+            "depth": best_depth,
+            "duration_hr": best_duration_hr,
+            "power": best_power,
+            "sde": float(bls_sde),
+            "snr": float(bls_snr),
+            "periods": periodogram.period.value.tolist(),
+            "power_spectrum": periodogram.power.tolist(),
+        }
+
+        logger.info(
+            f"  TIC {tic_id} BLS: P={best_period:.3f}d  "
+            f"SDE={bls_sde:.1f}  depth={best_depth*1e6:.0f}ppm  "
+            f"dur={best_duration_hr:.2f}h"
+        )
+
+    except ImportError:
+        logger.error("astropy.timeseries not available. Run: pip install astropy>=5.3")
+    except Exception as exc:
+        logger.error(f"  BLS failed for TIC {tic_id}: {exc}")
+
+    return result
+
+
+def merge_bls_into_candidate(
+    candidate: TransitCandidate,
+    bls_result: dict,
+) -> TransitCandidate:
+    """
+    Merge BLS results into an existing TransitCandidate.
+    Computes period agreement between TLS and BLS.
+    """
+    candidate.bls_period = bls_result.get("period", 0.0)
+    candidate.bls_t0 = bls_result.get("t0", 0.0)
+    candidate.bls_depth = bls_result.get("depth", 0.0)
+    candidate.bls_duration = bls_result.get("duration_hr", 0.0)
+    candidate.bls_power = bls_result.get("power", 0.0)
+    candidate.bls_sde = bls_result.get("sde", 0.0)
+    candidate.bls_snr = bls_result.get("snr", 0.0)
+    candidate.bls_raw = {
+        "periods": bls_result.get("periods", []),
+        "power_spectrum": bls_result.get("power_spectrum", []),
+    }
+
+    # Period agreement: check if TLS and BLS agree
+    if candidate.period > 0 and candidate.bls_period > 0:
+        # Check for exact match or harmonic (P, 2P, P/2)
+        ratio = candidate.bls_period / candidate.period
+        # Closest harmonic
+        harmonics = [0.5, 1.0, 2.0, 3.0, 1.0/3.0]
+        diffs = [abs(ratio - h) / h for h in harmonics]
+        candidate.period_agreement = min(diffs)
+    else:
+        candidate.period_agreement = 1.0  # no agreement possible
+
+    return candidate
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic sub-routines
 # ---------------------------------------------------------------------------
 
-def _odd_even_diff(results) -> float:
+def _odd_even_diff(
+    time: np.ndarray,
+    flux: np.ndarray,
+    period: float,
+    t0: float,
+    duration_days: float,
+) -> float:
     """
     Compute normalised odd-even transit depth difference.
-    High values (> 0.1) suggest eclipsing binary.
+
+    Separates transit events into odd (1st, 3rd, 5th, ...) and even
+    (2nd, 4th, 6th, ...) transits, measures the median in-transit
+    depth of each group, and returns the normalised difference:
+
+        odd_even_diff = |depth_odd - depth_even| / mean(depth_odd, depth_even)
+
+    High values (> 0.1) suggest an eclipsing binary (since the primary
+    and secondary eclipses would have different depths at P and P/2).
+
+    Parameters
+    ----------
+    time : np.ndarray   time array (BTJD)
+    flux : np.ndarray   normalised flux
+    period : float      orbital period in days
+    t0 : float          reference transit mid-time (BTJD)
+    duration_days : float  transit duration in days
+
+    Returns
+    -------
+    float : normalised odd-even depth difference (0 = identical)
     """
-    try:
-        odd_depths = []
-        even_depths = []
-        for i, (phase, flux_val) in enumerate(
-            zip(results.transit_times, getattr(results, "per_transit_count", []))
-        ):
-            _ = flux_val  # unused but kept for future use
-            # Approximate: use model depth with small noise
-        # If TLS provides these directly:
-        if hasattr(results, "odd_even_mismatch"):
-            return float(results.odd_even_mismatch)
+    if period <= 0 or duration_days <= 0:
         return 0.0
+
+    try:
+        # Find transit number for each point
+        transit_number = np.round((time - t0) / period).astype(int)
+        half_dur = duration_days / 2.0
+
+        # Identify in-transit points
+        phase_offset = np.abs((time - t0) - transit_number * period)
+        in_transit = phase_offset < half_dur
+
+        if in_transit.sum() < 4:
+            return 0.0
+
+        # Separate odd and even transit events
+        odd_mask = in_transit & (transit_number % 2 != 0)
+        even_mask = in_transit & (transit_number % 2 == 0)
+
+        if odd_mask.sum() < 2 or even_mask.sum() < 2:
+            return 0.0
+
+        # Compute median depth relative to out-of-transit baseline
+        out_transit = ~in_transit
+        if out_transit.sum() < 10:
+            baseline = 1.0
+        else:
+            baseline = float(np.nanmedian(flux[out_transit]))
+
+        odd_depth = baseline - float(np.nanmedian(flux[odd_mask]))
+        even_depth = baseline - float(np.nanmedian(flux[even_mask]))
+
+        mean_depth = (odd_depth + even_depth) / 2.0
+        if mean_depth <= 0:
+            return 0.0
+
+        return float(abs(odd_depth - even_depth) / mean_depth)
+
     except Exception:
         return 0.0
 
@@ -228,9 +471,14 @@ def search_all(
     sde_threshold: float = 7.0,
     period_min: float = 0.5,
     period_max: float = 27.0,
+    run_bls_search: bool = True,
 ) -> List[TransitCandidate]:
     """
-    Run TLS on every preprocessed CSV in processed_dir.
+    Run TLS and (optionally) BLS on every preprocessed CSV.
+
+    Both algorithms are run independently; the BLS results are merged
+    into the TransitCandidate for downstream use as extra features and
+    for cross-validation of the TLS period.
 
     Returns list of all TransitCandidate objects (including non-detections).
     """
@@ -239,7 +487,8 @@ def search_all(
         logger.warning(f"No processed CSVs found in {processed_dir}.")
         return []
 
-    logger.info(f"Running TLS on {len(csv_files)} light curves…")
+    algo_label = "TLS + BLS" if run_bls_search else "TLS"
+    logger.info(f"Running {algo_label} on {len(csv_files)} light curves…")
     candidates = []
 
     for csv_path in csv_files:
@@ -250,6 +499,7 @@ def search_all(
             flux = df["flux"].values
             flux_err = df["flux_err"].values if "flux_err" in df.columns else None
 
+            # --- TLS ---
             c = run_tls(
                 time, flux, flux_err,
                 tic_id=tic_id,
@@ -257,13 +507,32 @@ def search_all(
                 period_max=period_max,
                 sde_threshold=sde_threshold,
             )
+
+            # --- BLS ---
+            if run_bls_search:
+                bls_result = run_bls(
+                    time, flux, flux_err,
+                    tic_id=tic_id,
+                    period_min=period_min,
+                    period_max=period_max,
+                )
+                c = merge_bls_into_candidate(c, bls_result)
+
+                # If TLS missed it but BLS found a strong signal, flag it
+                if not c.passed_threshold and c.bls_sde >= sde_threshold:
+                    logger.info(
+                        f"  TIC {tic_id}: TLS below threshold but BLS SDE={c.bls_sde:.1f} "
+                        f"— flagging as candidate via BLS."
+                    )
+                    c.passed_threshold = True
+
             candidates.append(c)
         except Exception as exc:
             logger.error(f"Error processing {csv_path.name}: {exc}")
 
     n_passed = sum(1 for c in candidates if c.passed_threshold)
     logger.success(
-        f"TLS complete: {n_passed}/{len(candidates)} candidates above SDE > {sde_threshold}"
+        f"{algo_label} complete: {n_passed}/{len(candidates)} candidates above SDE > {sde_threshold}"
     )
     return candidates
 
@@ -286,5 +555,14 @@ def candidates_to_dataframe(candidates: List[TransitCandidate]) -> pd.DataFrame:
             "secondary_depth": c.secondary_depth,
             "shape_score": c.transit_shape_score,
             "passed_threshold": c.passed_threshold,
+            # BLS fields
+            "bls_period_d": c.bls_period,
+            "bls_t0": c.bls_t0,
+            "bls_depth_ppm": c.bls_depth * 1e6 if c.bls_depth < 1 else c.bls_depth,
+            "bls_duration_hr": c.bls_duration,
+            "bls_power": c.bls_power,
+            "bls_sde": c.bls_sde,
+            "bls_snr": c.bls_snr,
+            "period_agreement": c.period_agreement,
         })
     return pd.DataFrame(rows)

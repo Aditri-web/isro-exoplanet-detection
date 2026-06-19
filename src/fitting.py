@@ -157,12 +157,17 @@ def _chi2(
     time_phase: np.ndarray,
     flux: np.ndarray,
     flux_err: np.ndarray,
+    period_scale: float = 1.0,
 ) -> float:
-    rp_rs, a_rs, inc, t0_offset = params_vec
+    rp_rs, a_rs, inc, t0_offset, period_frac = params_vec
     if rp_rs <= 0 or a_rs <= 1 or inc < 60 or inc > 90:
         return 1e10
+    if period_frac <= 0.0:
+        return 1e10
 
-    model = batman_model(time_phase, rp_rs, a_rs, inc, t0_offset)
+    # Re-scale time by the fractional period adjustment
+    time_adj = time_phase / period_frac
+    model = batman_model(time_adj, rp_rs, a_rs, inc, t0_offset)
     residuals = (flux - model) / flux_err
     return float(np.sum(residuals ** 2))
 
@@ -233,27 +238,38 @@ def fit_transit(
     a_rs_init = _estimate_a_rs(period, duration_days, rp_rs_init)
     inc_init = 89.0
     t0_offset_init = 0.0
+    period_frac_init = 1.0  # fractional period adjustment (1.0 = no change)
 
-    x0 = np.array([rp_rs_init, a_rs_init, inc_init, t0_offset_init])
-    bounds = [(0.001, 0.5), (2.0, 200.0), (60.0, 90.0), (-duration_days, duration_days)]
+    x0 = np.array([rp_rs_init, a_rs_init, inc_init, t0_offset_init, period_frac_init])
+    bounds = [
+        (0.001, 0.5),          # rp_rs
+        (2.0, 200.0),          # a_rs
+        (60.0, 90.0),          # inc
+        (-duration_days, duration_days),  # t0_offset
+        (0.995, 1.005),        # period_frac: allow ±0.5% period adjustment
+    ]
 
     # --- Scipy Nelder-Mead optimisation ---
     try:
         opt = minimize(
             _chi2,
             x0,
-            args=(t_win, f_win, e_win),
+            args=(t_win, f_win, e_win, period),
             method="Nelder-Mead",
             options={"maxiter": 5000, "xatol": 1e-6, "fatol": 1e-8},
         )
 
-        rp_rs, a_rs, inc, t0_off = opt.x
+        rp_rs, a_rs, inc, t0_off, period_frac = opt.x
         rp_rs = abs(rp_rs)
         a_rs = abs(a_rs)
         inc = np.clip(inc, 60.0, 90.0)
+        period_frac = np.clip(period_frac, 0.995, 1.005)
+
+        # Compute refined period
+        refined_period = period * period_frac
 
         n_data = in_window.sum()
-        n_params = 4
+        n_params = 5  # rp_rs, a_rs, inc, t0_offset, period_frac
         dof = max(n_data - n_params, 1)
         chi2_val = float(opt.fun)
         reduced_chi2 = chi2_val / dof
@@ -263,13 +279,14 @@ def fit_transit(
         inc_rad = np.radians(inc)
         b = a_rs * np.cos(inc_rad)
         if b < 1.0:
-            dur_days = (period / np.pi) * np.arcsin(
+            dur_days = (refined_period / np.pi) * np.arcsin(
                 np.sqrt(((1 + rp_rs) ** 2 - b ** 2) / a_rs ** 2) / np.sin(inc_rad)
             )
         else:
             dur_days = duration_days  # fallback
 
         result.success = opt.success or reduced_chi2 < 10
+        result.period = float(refined_period)
         result.rp_rs = float(rp_rs)
         result.a_rs = float(a_rs)
         result.inc = float(inc)
@@ -281,16 +298,24 @@ def fit_transit(
         result.bic = bic
 
         # Parameter uncertainties via finite-difference Hessian approximation
-        errs = _param_uncertainties(opt.x, t_win, f_win, e_win, chi2_val)
+        errs = _param_uncertainties(opt.x, t_win, f_win, e_win, chi2_val, period)
         result.rp_rs_err = float(errs[0])
         result.a_rs_err = float(errs[1])
         result.inc_err = float(errs[2])
         result.t0_err = float(errs[3])
+        result.period_err = float(errs[4] * period)  # convert fractional to absolute
         result.depth_err = float(2 * rp_rs * result.rp_rs_err)
-        result.duration_err = float(dur_days * 24.0 * 0.1)  # 10% estimate
+
+        # Duration uncertainty via error propagation from a_rs, inc, rp_rs
+        result.duration_err = _compute_duration_err(
+            rp_rs, a_rs, inc, refined_period,
+            result.rp_rs_err, result.a_rs_err, result.inc_err,
+            result.period_err,
+        )
 
         logger.info(
             f"  TIC {tic_id}: Rp/Rs={rp_rs:.4f}±{result.rp_rs_err:.4f}  "
+            f"P={refined_period:.6f}±{result.period_err:.6f}d  "
             f"depth={result.depth*1e6:.0f}ppm  dur={result.duration:.2f}h  "
             f"χ²ᵣ={reduced_chi2:.2f}"
         )
@@ -329,6 +354,7 @@ def _param_uncertainties(
     f: np.ndarray,
     e: np.ndarray,
     chi2_min: float,
+    period: float = 1.0,
     delta_chi2: float = 1.0,
 ) -> np.ndarray:
     """
@@ -340,14 +366,59 @@ def _param_uncertainties(
         h = max(abs(x0[i]) * 0.01, 1e-5)
         x_plus = x0.copy(); x_plus[i] += h
         x_minus = x0.copy(); x_minus[i] -= h
-        chi2_plus = _chi2(x_plus, t, f, e)
-        chi2_minus = _chi2(x_minus, t, f, e)
+        chi2_plus = _chi2(x_plus, t, f, e, period)
+        chi2_minus = _chi2(x_minus, t, f, e, period)
         d2chi2 = (chi2_plus - 2 * chi2_min + chi2_minus) / (h ** 2)
         if d2chi2 > 0:
             errs[i] = np.sqrt(delta_chi2 / d2chi2)
         else:
             errs[i] = abs(h * 2)
     return errs
+
+
+def _compute_duration_err(
+    rp_rs: float, a_rs: float, inc: float, period: float,
+    rp_rs_err: float, a_rs_err: float, inc_err: float,
+    period_err: float,
+) -> float:
+    """
+    Estimate transit duration uncertainty via numerical error propagation.
+
+    Computes duration at (param ± err) for each parameter and
+    sums the partial derivatives in quadrature.
+
+    Returns
+    -------
+    float : duration uncertainty in hours
+    """
+    def _duration(rp, a, i_deg, p):
+        i_rad = np.radians(i_deg)
+        b = a * np.cos(i_rad)
+        if b >= 1.0 + rp or a <= 0 or p <= 0:
+            return 0.0
+        arg = np.sqrt(((1 + rp) ** 2 - b ** 2) / a ** 2) / np.sin(i_rad)
+        arg = np.clip(arg, -1, 1)
+        return (p / np.pi) * np.arcsin(arg) * 24.0  # hours
+
+    dur0 = _duration(rp_rs, a_rs, inc, period)
+    if dur0 <= 0:
+        return 0.0
+
+    partials_sq = 0.0
+    for param_idx, (val, err) in enumerate([
+        (rp_rs, rp_rs_err), (a_rs, a_rs_err), (inc, inc_err), (period, period_err)
+    ]):
+        if err <= 0:
+            continue
+        args = [rp_rs, a_rs, inc, period]
+        args[param_idx] = val + err
+        dur_plus = _duration(*args)
+        args[param_idx] = val - err
+        dur_minus = _duration(*args)
+        partial = (dur_plus - dur_minus) / (2.0 * err) if err > 0 else 0.0
+        partials_sq += (partial * err) ** 2
+
+    return float(np.sqrt(partials_sq))
 
 
 def _run_mcmc(
@@ -366,8 +437,10 @@ def _run_mcmc(
         pos = x0 + 1e-4 * np.random.randn(n_walkers, ndim)
 
         def log_prob(params):
-            rp, a, inc, t0 = params
+            rp, a, inc, t0, pfrac = params
             if rp <= 0 or a <= 1 or inc < 60 or inc > 90:
+                return -np.inf
+            if pfrac < 0.99 or pfrac > 1.01:
                 return -np.inf
             chi2 = _chi2(params, t, f, e)
             return -0.5 * chi2
@@ -378,10 +451,11 @@ def _run_mcmc(
         # Discard burn-in (50%) and thin
         samples = sampler.get_chain(discard=n_steps // 2, thin=15, flat=True)
         return {
-            "rp_rs":  samples[:, 0].tolist(),
-            "a_rs":   samples[:, 1].tolist(),
-            "inc":    samples[:, 2].tolist(),
-            "t0_off": samples[:, 3].tolist(),
+            "rp_rs":      samples[:, 0].tolist(),
+            "a_rs":       samples[:, 1].tolist(),
+            "inc":        samples[:, 2].tolist(),
+            "t0_off":     samples[:, 3].tolist(),
+            "period_frac": samples[:, 4].tolist(),
         }
     except ImportError:
         logger.warning("  emcee not installed; skipping MCMC.")
@@ -430,7 +504,8 @@ def fit_all_planets(
     planet_mask = detections_df["predicted_class"] == "PLANET"
 
     fit_cols = [
-        "fit_success", "fit_rp_rs", "fit_rp_rs_err",
+        "fit_success", "fit_period", "fit_period_err",
+        "fit_rp_rs", "fit_rp_rs_err",
         "fit_depth_ppm", "fit_depth_ppm_err",
         "fit_duration_hr", "fit_duration_hr_err",
         "fit_t0", "fit_t0_err",
@@ -467,6 +542,8 @@ def fit_all_planets(
             )
 
             detections_df.loc[idx, "fit_success"] = fr.success
+            detections_df.loc[idx, "fit_period"] = fr.period
+            detections_df.loc[idx, "fit_period_err"] = fr.period_err
             detections_df.loc[idx, "fit_rp_rs"] = fr.rp_rs
             detections_df.loc[idx, "fit_rp_rs_err"] = fr.rp_rs_err
             detections_df.loc[idx, "fit_depth_ppm"] = fr.depth * 1e6

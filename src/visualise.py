@@ -41,6 +41,7 @@ COLOURS = {
     "detrend": "#38bdf8",
     "model":  "#f59e0b",
     "transit": "#ef4444",
+    "bls":    "#22d3ee",
 }
 
 plt.style.use("dark_background")
@@ -131,6 +132,45 @@ def plot_periodogram(
     ax.set_xlabel("Period (days)", color="#cbd5e1", labelpad=6)
     ax.set_ylabel("SDE (Signal Detection Efficiency)", color="#cbd5e1", labelpad=6)
     ax.set_title(f"TIC {tic_id}  —  TLS Periodogram", color="#f1f5f9", pad=10)
+    ax.legend(framealpha=0.2, labelcolor="#f1f5f9", facecolor="#1e293b")
+    ax.tick_params(colors="#94a3b8")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#334155")
+    ax.set_xscale("log")
+
+    plt.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.debug(f"  Saved: {out.name}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 2b. BLS periodogram
+# ---------------------------------------------------------------------------
+
+def plot_bls_periodogram(
+    periods: np.ndarray,
+    power: np.ndarray,
+    best_period: float,
+    tic_id: str = "unknown",
+    save_dir: Path = FIGURES_DIR,
+) -> Path:
+    """Plot BLS power periodogram."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out = save_dir / f"TIC{tic_id}_bls_periodogram.png"
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    fig.patch.set_facecolor("#0f172a")
+    ax.set_facecolor("#1e293b")
+
+    ax.plot(periods, power, color=COLOURS["bls"], linewidth=0.8, alpha=0.9)
+    ax.axvline(best_period, color=COLOURS["transit"], linewidth=1.5, linestyle="-",
+               label=f"Best period = {best_period:.4f} d")
+
+    ax.set_xlabel("Period (days)", color="#cbd5e1", labelpad=6)
+    ax.set_ylabel("BLS Power (SR)", color="#cbd5e1", labelpad=6)
+    ax.set_title(f"TIC {tic_id}  \u2014  BLS Periodogram", color="#f1f5f9", pad=10)
     ax.legend(framealpha=0.2, labelcolor="#f1f5f9", facecolor="#1e293b")
     ax.tick_params(colors="#94a3b8")
     for spine in ax.spines.values():
@@ -320,6 +360,10 @@ def plot_candidate_panel(
     depth_ppm: float,
     tls_periods: Optional[np.ndarray] = None,
     tls_power: Optional[np.ndarray] = None,
+    bls_periods: Optional[np.ndarray] = None,
+    bls_power: Optional[np.ndarray] = None,
+    bls_period: Optional[float] = None,
+    bls_sde: float = 0.0,
     model_phase: Optional[np.ndarray] = None,
     model_flux: Optional[np.ndarray] = None,
     tic_id: str = "unknown",
@@ -329,18 +373,23 @@ def plot_candidate_panel(
     sde: float = 0.0,
     save_dir: Path = FIGURES_DIR,
 ) -> Path:
-    """3-panel figure: raw LC | periodogram | phase-fold."""
+    """4-panel figure: raw LC | TLS periodogram | BLS periodogram | phase-fold."""
     save_dir.mkdir(parents=True, exist_ok=True)
     out = save_dir / f"TIC{tic_id}_panel.png"
 
-    fig = plt.figure(figsize=(18, 5))
+    has_bls = (bls_periods is not None and bls_power is not None
+               and len(bls_periods) > 0)
+    n_cols = 4 if has_bls else 3
+
+    fig = plt.figure(figsize=(6 * n_cols, 5))
     fig.patch.set_facecolor("#0f172a")
-    gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.32)
+    gs = gridspec.GridSpec(1, n_cols, figure=fig, wspace=0.32)
 
     cls_colour = COLOURS.get(label, COLOURS["OTHER"])
+    col_idx = 0
 
     # --- Panel 1: Light curve ---
-    ax1 = fig.add_subplot(gs[0])
+    ax1 = fig.add_subplot(gs[col_idx]); col_idx += 1
     ax1.set_facecolor("#1e293b")
     ax1.scatter(time, flux, s=1, c=COLOURS["detrend"], alpha=0.6, linewidths=0)
 
@@ -355,8 +404,8 @@ def plot_candidate_panel(
     ax1.set_title("Light Curve", color="#f1f5f9", fontsize=10)
     ax1.tick_params(colors="#94a3b8", labelsize=8)
 
-    # --- Panel 2: Periodogram ---
-    ax2 = fig.add_subplot(gs[1])
+    # --- Panel 2: TLS Periodogram ---
+    ax2 = fig.add_subplot(gs[col_idx]); col_idx += 1
     ax2.set_facecolor("#1e293b")
     if tls_periods is not None and tls_power is not None and len(tls_periods) > 0:
         ax2.plot(tls_periods, tls_power, color=COLOURS["detrend"], linewidth=0.7)
@@ -368,8 +417,27 @@ def plot_candidate_panel(
     ax2.set_title(f"TLS Periodogram  |  SDE={sde:.1f}", color="#f1f5f9", fontsize=10)
     ax2.tick_params(colors="#94a3b8", labelsize=8)
 
-    # --- Panel 3: Phase fold ---
-    ax3 = fig.add_subplot(gs[2])
+    # --- Panel 3: BLS Periodogram (if available) ---
+    if has_bls:
+        ax_bls = fig.add_subplot(gs[col_idx]); col_idx += 1
+        ax_bls.set_facecolor("#1e293b")
+        ax_bls.plot(bls_periods, bls_power, color=COLOURS["bls"], linewidth=0.7)
+        if bls_period is not None and bls_period > 0:
+            ax_bls.axvline(bls_period, color=COLOURS["transit"], linewidth=1.5,
+                           linestyle="-", label=f"P={bls_period:.3f}d")
+        ax_bls.axvline(period, color=cls_colour, linewidth=1, linestyle=":",
+                       alpha=0.6, label=f"TLS P={period:.3f}d")
+        ax_bls.set_xscale("log")
+        ax_bls.set_xlabel("Period (days)", color="#cbd5e1", fontsize=9)
+        ax_bls.set_ylabel("BLS Power", color="#cbd5e1", fontsize=9)
+        ax_bls.set_title(f"BLS Periodogram  |  SDE={bls_sde:.1f}",
+                         color="#f1f5f9", fontsize=10)
+        ax_bls.tick_params(colors="#94a3b8", labelsize=8)
+        ax_bls.legend(framealpha=0.2, labelcolor="#f1f5f9",
+                      facecolor="#1e293b", fontsize=7, loc="upper right")
+
+    # --- Panel N: Phase fold ---
+    ax3 = fig.add_subplot(gs[col_idx])
     ax3.set_facecolor("#1e293b")
 
     phase = ((time - t0) % period) / period
@@ -403,7 +471,10 @@ def plot_candidate_panel(
     ax3.set_title(f"Phase Fold  |  SNR={snr:.1f}", color="#f1f5f9", fontsize=10)
     ax3.tick_params(colors="#94a3b8", labelsize=8)
 
-    for ax in [ax1, ax2, ax3]:
+    all_axes = [ax1, ax2, ax3]
+    if has_bls:
+        all_axes.insert(2, ax_bls)
+    for ax in all_axes:
         for spine in ax.spines.values():
             spine.set_edgecolor("#334155")
 

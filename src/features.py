@@ -37,6 +37,11 @@ FEATURE_COLS = [
     "scatter_in",             # std of in-transit flux
     "scatter_out",            # std of out-of-transit flux
     "scatter_ratio",          # scatter_in / scatter_out
+    # BLS-derived features
+    "bls_sde",                # BLS Signal Detection Efficiency
+    "bls_snr",                # BLS signal-to-noise
+    "bls_power",              # BLS peak power (SR statistic)
+    "period_agreement",       # TLS/BLS period agreement (0 = match)
 ]
 
 CLASS_LABELS = {
@@ -91,6 +96,11 @@ def extract_features_from_candidate(
         "scatter_in":           0.0,
         "scatter_out":          0.0,
         "scatter_ratio":        1.0,
+        # BLS features
+        "bls_sde":              getattr(candidate, "bls_sde", 0.0),
+        "bls_snr":              getattr(candidate, "bls_snr", 0.0),
+        "bls_power":            getattr(candidate, "bls_power", 0.0),
+        "period_agreement":     getattr(candidate, "period_agreement", 1.0),
     }
 
     # Compute scatter metrics if time/flux available
@@ -115,7 +125,8 @@ def _compute_scatter(
     """Return std of flux inside and outside transit windows."""
     phase = ((time - t0) % period) / period
     half_dur = (duration / period) / 2.0
-    in_mask = phase < half_dur
+    # Handle wrap-around: in-transit near phase 0 or phase 1
+    in_mask = (phase < half_dur) | (phase > 1.0 - half_dur)
     out_mask = ~in_mask
 
     std_in = float(np.nanstd(flux[in_mask])) if in_mask.sum() > 1 else 0.0

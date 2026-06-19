@@ -37,6 +37,11 @@ def generate_class(n: int, cls: str) -> pd.DataFrame:
         shape       = rng.beta(8, 2, n)          # U-shaped → high score
         scatter_in  = depth_ppm / 1e6 * rng.uniform(0.8, 1.2, n)
         scatter_out = rng.uniform(1e-4, 3e-4, n)
+        # BLS features: should agree well with TLS for planets
+        bls_sde     = sde * rng.uniform(0.7, 1.3, n)
+        bls_snr     = snr * rng.uniform(0.6, 1.1, n)
+        bls_power   = rng.uniform(0.01, 0.15, n)
+        period_agr  = rng.exponential(0.02, n).clip(0, 0.15)  # good agreement
 
     elif cls == "EB":
         # Deep dips, secondary eclipse, V-shape, odd-even difference
@@ -51,6 +56,11 @@ def generate_class(n: int, cls: str) -> pd.DataFrame:
         shape       = rng.beta(2, 5, n)          # V-shaped → low score
         scatter_in  = depth_ppm / 1e6 * rng.uniform(0.9, 1.1, n)
         scatter_out = rng.uniform(2e-4, 5e-4, n)
+        # BLS: EBs are very strong in BLS too
+        bls_sde     = sde * rng.uniform(0.8, 1.5, n)
+        bls_snr     = snr * rng.uniform(0.8, 1.2, n)
+        bls_power   = rng.uniform(0.05, 0.6, n)
+        period_agr  = rng.uniform(0, 0.15, n)  # may lock on half-period
 
     elif cls == "BLEND":
         # Background EB: shallow but odd-even, secondary still present
@@ -65,6 +75,11 @@ def generate_class(n: int, cls: str) -> pd.DataFrame:
         shape       = rng.beta(4, 4, n)
         scatter_in  = depth_ppm / 1e6 * rng.uniform(0.8, 1.3, n)
         scatter_out = rng.uniform(1.5e-4, 4e-4, n)
+        # BLS: blends have moderate BLS detection
+        bls_sde     = sde * rng.uniform(0.5, 1.2, n)
+        bls_snr     = snr * rng.uniform(0.4, 1.0, n)
+        bls_power   = rng.uniform(0.005, 0.1, n)
+        period_agr  = rng.uniform(0.02, 0.4, n)  # moderate disagreement
 
     else:  # OTHER (noise, systematics, etc.)
         depth_ppm   = rng.uniform(50, 5000, n)
@@ -78,6 +93,11 @@ def generate_class(n: int, cls: str) -> pd.DataFrame:
         shape       = rng.uniform(0.1, 0.9, n)
         scatter_in  = rng.uniform(1e-4, 5e-4, n)
         scatter_out = rng.uniform(1e-4, 5e-4, n)
+        # BLS: noise/systematics — weak BLS signals, poor agreement
+        bls_sde     = rng.uniform(0.5, 8, n)
+        bls_snr     = rng.uniform(0.5, 10, n)
+        bls_power   = rng.uniform(0.001, 0.03, n)
+        period_agr  = rng.uniform(0.1, 1.0, n)  # poor agreement
 
     rp_rs = np.sqrt(np.clip(depth_ppm / 1e6, 1e-8, 1.0))
 
@@ -98,6 +118,10 @@ def generate_class(n: int, cls: str) -> pd.DataFrame:
         "scatter_in":           scatter_in,
         "scatter_out":          scatter_out,
         "scatter_ratio":        scatter_in / (scatter_out + 1e-8),
+        "bls_sde":              np.clip(bls_sde, 0.1, 999),
+        "bls_snr":              np.clip(bls_snr, 0.1, 9999),
+        "bls_power":            np.clip(bls_power, 0, 1),
+        "period_agreement":     np.clip(period_agr, 0, 2),
         "label":                cls,
     })
     return df

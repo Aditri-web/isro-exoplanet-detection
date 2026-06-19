@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -51,7 +52,10 @@ def build_pipeline(model_type: str = "rf") -> Pipeline:
     Parameters
     ----------
     model_type : str
-        "rf" (Random Forest) or "gb" (Gradient Boosting / XGBoost-like)
+        "rf"  — Random Forest (default, good out-of-box)
+        "gb"  — sklearn Gradient Boosting
+        "xgb" — XGBoost (recommended for production; better with
+                class imbalance, regularization, and calibration)
     """
     if model_type == "rf":
         clf = RandomForestClassifier(
@@ -70,6 +74,32 @@ def build_pipeline(model_type: str = "rf") -> Pipeline:
             subsample=0.8,
             random_state=42,
         )
+    elif model_type == "xgb":
+        try:
+            from xgboost import XGBClassifier
+            clf = XGBClassifier(
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,          # L1 regularization
+                reg_lambda=1.0,         # L2 regularization
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                use_label_encoder=False,
+                random_state=42,
+                n_jobs=-1,
+            )
+        except ImportError:
+            logger.warning(
+                "  xgboost not installed; falling back to sklearn GradientBoosting. "
+                "Run: pip install xgboost"
+            )
+            clf = GradientBoostingClassifier(
+                n_estimators=200, max_depth=4,
+                learning_rate=0.05, subsample=0.8, random_state=42,
+            )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -156,7 +186,26 @@ def train(
     joblib.dump(pipeline, output_path)
     logger.success(f"  Model saved → {output_path}")
 
-    return pipeline, metrics
+    # --- Calibrate probabilities ---
+    # CalibratedClassifierCV re-fits using cross-validation to produce
+    # well-calibrated probability estimates (Platt scaling / isotonic).
+    logger.info("  Calibrating classifier probabilities (Platt scaling)...")
+    try:
+        calibrated = CalibratedClassifierCV(
+            pipeline, cv=min(cv_folds, 3), method="sigmoid",
+        )
+        calibrated.fit(X_arr, y)
+
+        # Save calibrated model alongside the raw model
+        cal_path = output_path.parent / (output_path.stem + "_calibrated.pkl")
+        joblib.dump(calibrated, cal_path)
+        logger.success(f"  Calibrated model saved → {cal_path}")
+
+        # Return the calibrated pipeline for downstream use
+        return calibrated, metrics
+    except Exception as exc:
+        logger.warning(f"  Calibration failed ({exc}); using uncalibrated model.")
+        return pipeline, metrics
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +221,13 @@ def load_model(model_path: Path = MODEL_PATH) -> Optional[Pipeline]:
 
 
 def predict(
-    pipeline: Pipeline,
+    pipeline,  # Pipeline or CalibratedClassifierCV
     X: pd.DataFrame,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Classify candidates.
+
+    Supports both raw sklearn Pipeline and CalibratedClassifierCV.
 
     Returns
     -------
@@ -227,6 +278,10 @@ def classify_candidates(
     feature_df.loc[idx, "predicted_class"] = [CLASS_LABELS.get(l, "OTHER") for l in labels]
     feature_df.loc[idx, "confidence"] = probs.max(axis=1)
 
+    # Check if probabilities are calibrated
+    is_calibrated = hasattr(pipeline, "calibrated_classifiers_")
+    feature_df["confidence_calibrated"] = is_calibrated
+
     for i, cls in CLASS_LABELS.items():
         if i < probs.shape[1]:
             feature_df.loc[idx, f"prob_{cls}"] = probs[:, i]
@@ -244,9 +299,20 @@ def classify_candidates(
 # Feature importance
 # ---------------------------------------------------------------------------
 
-def feature_importance(pipeline: Pipeline) -> pd.DataFrame:
-    """Extract feature importance from the trained Random Forest."""
-    clf = pipeline.named_steps["clf"]
+def feature_importance(pipeline) -> pd.DataFrame:
+    """Extract feature importance from the trained classifier."""
+    # Handle CalibratedClassifierCV wrapper
+    if hasattr(pipeline, "estimator"):
+        inner = pipeline.estimator
+    else:
+        inner = pipeline
+
+    # Navigate to the actual classifier inside the sklearn Pipeline
+    if hasattr(inner, "named_steps"):
+        clf = inner.named_steps["clf"]
+    else:
+        clf = inner
+
     if not hasattr(clf, "feature_importances_"):
         return pd.DataFrame()
 

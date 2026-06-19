@@ -132,19 +132,27 @@ def _build_pdf(
     ]
     _bullet_list(pdf, steps)
 
-    _subsection(pdf, "1.3  Period Search")
+    _subsection(pdf, "1.3  Period Search (TLS + BLS)")
     _body(pdf,
-        "TransitLeastSquares (TLS; Hippke & Heller 2019) was run on each detrended light curve "
-        f"over the period range 0.5–27 days. Candidates with SDE > {sde_threshold} were retained "
-        "for further analysis (SDE = Signal Detection Efficiency, analogous to signal-to-noise)."
+        "Two complementary period search algorithms were run on each detrended light curve "
+        f"over the period range 0.5-27 days. Candidates with SDE > {sde_threshold} from "
+        "either algorithm were retained for further analysis."
+    )
+    _body(pdf,
+        "TransitLeastSquares (TLS; Hippke & Heller 2019) uses optimised transit-shaped "
+        "templates matched to realistic limb-darkened stellar models. "
+        "Box Least Squares (BLS; Kovacs, Zucker & Mazeh 2002) uses a simple box-shaped "
+        "template via astropy.timeseries.BoxLeastSquares. Both algorithms are run independently; "
+        "period agreement between TLS and BLS is computed as an additional classification feature."
     )
     _body(pdf,
         "Additional diagnostics computed per candidate:"
     )
     diag = [
-        "Odd–even transit depth difference (flags eclipsing binaries: |Δdepth|/depth > 0.1).",
+        "Odd-even transit depth difference (flags eclipsing binaries: |depth_diff|/depth > 0.1).",
         "Secondary eclipse depth at orbital phase 0.5 (flags EBs and blends).",
-        "Transit shape score: ingress fraction (U-shape → planet; V-shape → EB).",
+        "Transit shape score: ingress fraction (U-shape -> planet; V-shape -> EB).",
+        "TLS/BLS period agreement: fractional period discrepancy (0 = perfect match).",
     ]
     _bullet_list(pdf, diag)
 
@@ -171,16 +179,16 @@ def _build_pdf(
 
     _subsection(pdf, "1.6  Libraries & Tools")
     libs = [
-        "lightkurve 2.4+ — TESS data access and basic LC operations",
-        "transitleastsquares 1.0+ — TLS period search (BLS-like)",
-        "wotan 1.10+ — robust biweight detrending",
-        "batman-package 2.4+ — analytic transit model",
-        "scikit-learn 1.3+ — Random Forest classifier",
-        "emcee 3.1+ — MCMC parameter estimation (optional)",
-        "astropy 5.3+ — FITS I/O, time systems",
-        "scipy 1.11+ — optimisation",
-        "matplotlib / plotly — static and interactive visualisation",
-        "fpdf2 — report generation",
+        "lightkurve 2.4+ -- TESS data access and basic LC operations",
+        "transitleastsquares 1.0+ -- TLS period search",
+        "astropy 5.3+ -- FITS I/O, time systems, BoxLeastSquares (BLS)",
+        "wotan 1.10+ -- robust biweight detrending",
+        "batman-package 2.4+ -- analytic transit model",
+        "scikit-learn 1.3+ -- Random Forest classifier with calibrated probabilities",
+        "emcee 3.1+ -- MCMC parameter estimation (optional)",
+        "scipy 1.11+ -- optimisation",
+        "matplotlib / plotly -- static and interactive visualisation",
+        "fpdf2 -- report generation",
     ]
     _bullet_list(pdf, libs)
 

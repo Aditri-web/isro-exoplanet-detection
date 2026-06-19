@@ -78,8 +78,8 @@ def _import_src():
 @click.option("--run-mcmc",    is_flag=True,  help="Run emcee MCMC for parameter uncertainties (slow).")
 @click.option("--model-type",
               default="rf",
-              type=click.Choice(["rf", "gb"]),
-              help="Classifier type.", show_default=True)
+              type=click.Choice(["rf", "gb", "xgb"]),
+              help="Classifier type (rf=RandomForest, gb=GradientBoosting, xgb=XGBoost).", show_default=True)
 @click.option("--output-dir",  default="results", help="Output directory.", show_default=True)
 @click.option("--log-level",   default="INFO",   help="Log level.", show_default=True)
 def main(
@@ -123,7 +123,7 @@ def main(
     # STEP 1: Download
     # ──────────────────────────────────────────────────────────────────
     if mode in ("full", "detect"):
-        logger.info("\n[Step 1/6] Downloading TESS light curves…")
+        logger.info("\n[Step 1/7] Downloading TESS light curves…")
 
         # Use known planet hosts as a reliable test set
         downloaded = download_known_planets(sector=sector, max_targets=min(n_targets, 20))
@@ -144,7 +144,7 @@ def main(
     # STEP 2: Preprocess
     # ──────────────────────────────────────────────────────────────────
     if mode in ("full", "detect"):
-        logger.info("\n[Step 2/6] Preprocessing light curves…")
+        logger.info("\n[Step 2/7] Preprocessing light curves…")
         raw_dir = Path("data/raw")
         processed_dir = Path("data/processed")
         fits_files = sorted(raw_dir.glob("*.fits"))
@@ -165,7 +165,7 @@ def main(
     feature_df = pd.DataFrame()
 
     if mode in ("full", "detect"):
-        logger.info(f"\n[Step 3/6] Running TLS period search (SDE > {sde_threshold})…")
+        logger.info(f"\n[Step 3/7] Running TLS + BLS period search (SDE > {sde_threshold})…")
         candidates = search_all(
             processed_dir=Path("data/processed"),
             sde_threshold=sde_threshold,
@@ -189,7 +189,7 @@ def main(
 
     if mode in ("full", "train", "detect"):
         if not no_retrain and label_csv:
-            logger.info(f"\n[Step 4/6] Training classifier on {label_csv}…")
+            logger.info(f"\n[Step 4/7] Training classifier on {label_csv}…")
             try:
                 X_train, y_train = load_labelled_dataset(Path(label_csv))
                 pipeline_clf, metrics = train(
@@ -211,7 +211,7 @@ def main(
                 logger.error(f"  Training failed: {exc}. Attempting to load saved model.")
                 pipeline_clf = load_model()
         else:
-            logger.info("\n[Step 4/6] Loading saved classifier…")
+            logger.info("\n[Step 4/7] Loading saved classifier…")
             pipeline_clf = load_model()
             if pipeline_clf is None and len(feature_df) > 0:
                 logger.warning("  No saved model found. Candidates will not be classified.")
@@ -222,7 +222,7 @@ def main(
     detections_df = pd.DataFrame()
 
     if mode in ("full", "detect") and len(feature_df) > 0:
-        logger.info("\n[Step 5/6] Classifying candidates…")
+        logger.info("\n[Step 5/7] Classifying candidates…")
 
         if pipeline_clf is not None:
             detections_df = classify_candidates(candidates, feature_df, pipeline_clf)
@@ -251,7 +251,7 @@ def main(
 
         # Plot individual PLANET candidates (top 5 by confidence)
         planet_cands = (
-            detections_df[detections_df.get("predicted_class", pd.Series()) == "PLANET"]
+            detections_df[detections_df["predicted_class"] == "PLANET"]
             .sort_values("confidence", ascending=False)
             .head(5)
         ) if "predicted_class" in detections_df.columns else pd.DataFrame()
@@ -271,10 +271,21 @@ def main(
                 matching = [c for c in candidates if c.tic_id == tic_id]
                 tls_periods = None
                 tls_power = None
+                bls_periods_arr = None
+                bls_power_arr = None
+                bls_period_val = None
+                bls_sde_val = 0.0
                 if matching:
                     raw = matching[0].raw_results
                     tls_periods = np.array(raw.get("periods", []))
                     tls_power = np.array(raw.get("power", []))
+                    # BLS data
+                    bls_raw = getattr(matching[0], "bls_raw", {})
+                    if bls_raw.get("periods"):
+                        bls_periods_arr = np.array(bls_raw["periods"])
+                        bls_power_arr = np.array(bls_raw["power_spectrum"])
+                    bls_period_val = getattr(matching[0], "bls_period", None)
+                    bls_sde_val = getattr(matching[0], "bls_sde", 0.0)
 
                 plot_candidate_panel(
                     time=time_arr,
@@ -285,6 +296,10 @@ def main(
                     depth_ppm=float(row.get("depth_ppm", 1000.0)),
                     tls_periods=tls_periods,
                     tls_power=tls_power,
+                    bls_periods=bls_periods_arr,
+                    bls_power=bls_power_arr,
+                    bls_period=bls_period_val,
+                    bls_sde=bls_sde_val,
                     tic_id=tic_id,
                     label=str(row.get("predicted_class", "PLANET")),
                     confidence=float(row.get("confidence", 0.0)),
@@ -302,7 +317,7 @@ def main(
     # STEP 6: Parameter fitting
     # ──────────────────────────────────────────────────────────────────
     if mode in ("full", "fit") and len(detections_df) > 0:
-        logger.info("\n[Step 6/6] Fitting transit models for PLANET candidates…")
+        logger.info("\n[Step 6/7] Fitting transit models for PLANET candidates…")
         detections_df = fit_all_planets(detections_df, run_mcmc=run_mcmc)
         detections_path = output_dir / "detections_fitted.csv"
         detections_df.to_csv(detections_path, index=False)
@@ -312,7 +327,7 @@ def main(
     # STEP 7: Generate PDF report
     # ──────────────────────────────────────────────────────────────────
     if mode in ("full", "report"):
-        logger.info("\n[Step 7/6] Generating PDF report…")
+        logger.info("\n[Step 7/7] Generating PDF report…")
         report_path = generate_report(
             detections_df=detections_df if len(detections_df) > 0 else pd.DataFrame(),
             metrics=metrics,
